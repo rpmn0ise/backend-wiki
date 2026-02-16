@@ -1,0 +1,19 @@
+{
+  "name": "sgpi-wiki-auth",
+  "version": "1.0.0",
+  "description": "Backend authentification pour Wiki SGPI",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "mongodb": "^6.3.0",
+    "bcrypt": "^5.1.1",
+    "dotenv": "^16.3.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
