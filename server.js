@@ -21,6 +21,7 @@ async function connectDB() {
         db = client.db("sgpi_wiki");
         console.log("✅ MongoDB Atlas connecté avec succès");
         
+        // Créer les collections si elles n'existent pas
         const collections = await db.listCollections().toArray();
         const collectionNames = collections.map(c => c.name);
         
@@ -39,11 +40,45 @@ async function connectDB() {
             console.log("📁 Collection 'registration_keys' créée");
         }
         
+        // Créer les index pour performance et contraintes
         await db.collection("users").createIndex({ username: 1 }, { unique: true });
         await db.collection("sessions").createIndex({ token: 1 }, { unique: true });
         await db.collection("sessions").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
         await db.collection("registration_keys").createIndex({ key: 1 }, { unique: true });
         
+// Créer les nouvelles collections pour le panel admin
+        if (!collectionNames.includes("categories")) {
+            await db.createCollection("categories");
+            console.log("📁 Collection 'categories' créée");
+        }
+        
+        if (!collectionNames.includes("links")) {
+            await db.createCollection("links");
+            console.log("📁 Collection 'links' créée");
+        }
+        
+        if (!collectionNames.includes("admin_logs")) {
+            await db.createCollection("admin_logs");
+            console.log("📁 Collection 'admin_logs' créée");
+        }
+        
+        if (!collectionNames.includes("forums")) {
+            await db.createCollection("forums");
+            console.log("📁 Collection 'forums' créée");
+        }
+        
+        if (!collectionNames.includes("forum_posts")) {
+            await db.createCollection("forum_posts");
+            console.log("📁 Collection 'forum_posts' créée");
+        }
+        
+        // Index pour les nouvelles collections
+        await db.collection("categories").createIndex({ order: 1 });
+        await db.collection("links").createIndex({ categoryId: 1, sectionId: 1, order: 1 });
+        await db.collection("admin_logs").createIndex({ timestamp: -1 });
+        await db.collection("forum_posts").createIndex({ forumId: 1, createdAt: -1 });
+
+
         console.log("✅ Index MongoDB créés");
         
     } catch (err) {
@@ -53,8 +88,10 @@ async function connectDB() {
     }
 }
 
+// Connexion à la base de données au démarrage
 connectDB();
 
+// Fermer proprement la connexion MongoDB lors de l'arrêt
 process.on('SIGINT', async () => {
     await client.close();
     console.log("MongoDB déconnecté");
@@ -101,23 +138,28 @@ app.use((req, res, next) => {
 // HELPER FUNCTIONS
 // ===================================
 
+// Générer un token de session aléatoire
 function generateSessionToken() {
     return crypto.randomBytes(32).toString('hex');
 }
 
+// Générer une clé d'inscription format SGPI-xxxxxxxx
 function generateRegistrationKey() {
     return 'SGPI-' + crypto.randomBytes(4).toString('hex');
 }
 
+// Hasher un mot de passe avec bcrypt
 async function hashPassword(password) {
     const saltRounds = 10;
     return await bcrypt.hash(password, saltRounds);
 }
 
+// Vérifier un mot de passe
 async function verifyPassword(password, hash) {
     return await bcrypt.compare(password, hash);
 }
 
+// Vérifier si une session est valide
 async function verifySession(token) {
     if (!token) return null;
     
@@ -147,6 +189,7 @@ async function verifySession(token) {
     }
 }
 
+// Middleware pour vérifier l'authentification
 async function requireAuth(req, res, next) {
     const token = req.headers.authorization?.replace('Bearer ', '');
     
@@ -168,6 +211,7 @@ async function requireAuth(req, res, next) {
     next();
 }
 
+// Middleware pour vérifier les droits admin
 function requireAdmin(req, res, next) {
     const adminKey = req.headers['x-admin-key'] || req.query.admin_key;
     
@@ -185,9 +229,17 @@ function requireAdmin(req, res, next) {
 app.post("/api/auth/register", async (req, res) => {
     const { registrationKey, username, password, passwordConfirm } = req.body;
     
+    // ===== VALIDATIONS =====
+    
     if (!registrationKey || !username || !password || !passwordConfirm) {
         return res.status(400).json({ 
-            error: "Tous les champs sont requis"
+            error: "Tous les champs sont requis",
+            details: {
+                registrationKey: !registrationKey,
+                username: !username,
+                password: !password,
+                passwordConfirm: !passwordConfirm
+            }
         });
     }
     
@@ -210,27 +262,34 @@ app.post("/api/auth/register", async (req, res) => {
     }
     
     try {
+        // ===== VÉRIFIER LA CLÉ D'INSCRIPTION =====
+        
         const key = await db.collection("registration_keys").findOne({ 
             key: registrationKey 
         });
         
         if (!key) {
             return res.status(404).json({ 
-                error: "Clé d'inscription invalide"
+                error: "Clé d'inscription invalide",
+                hint: "Vérifiez que vous avez copié la clé correctement"
             });
         }
         
         if (key.used) {
             return res.status(403).json({ 
-                error: "Cette clé a déjà été utilisée"
+                error: "Cette clé a déjà été utilisée",
+                usedAt: key.usedAt
             });
         }
         
         if (new Date(key.expiresAt) < new Date()) {
             return res.status(403).json({ 
-                error: "Cette clé a expiré"
+                error: "Cette clé a expiré",
+                expiresAt: key.expiresAt
             });
         }
+        
+        // ===== VÉRIFIER SI LE PSEUDO EST DISPONIBLE =====
         
         const existingUser = await db.collection("users").findOne({ 
             username: username 
@@ -238,9 +297,12 @@ app.post("/api/auth/register", async (req, res) => {
         
         if (existingUser) {
             return res.status(409).json({ 
-                error: "Ce pseudo est déjà pris"
+                error: "Ce pseudo est déjà pris",
+                suggestion: `Essayez ${username}${Math.floor(Math.random() * 100)}`
             });
         }
+        
+        // ===== CRÉER L'UTILISATEUR =====
         
         const passwordHash = await hashPassword(password);
         
@@ -254,6 +316,8 @@ app.post("/api/auth/register", async (req, res) => {
         };
         
         const result = await db.collection("users").insertOne(newUser);
+        
+        // ===== MARQUER LA CLÉ COMME UTILISÉE =====
         
         await db.collection("registration_keys").updateOne(
             { key: registrationKey },
@@ -288,7 +352,8 @@ app.post("/api/auth/register", async (req, res) => {
         }
         
         res.status(500).json({ 
-            error: "Erreur serveur lors de l'inscription"
+            error: "Erreur serveur lors de l'inscription",
+            details: process.env.NODE_ENV === 'development' ? err.message : undefined
         });
     }
 });
@@ -300,6 +365,8 @@ app.post("/api/auth/register", async (req, res) => {
 app.post("/api/auth/login", async (req, res) => {
     const { username, password } = req.body;
     
+    // ===== VALIDATIONS =====
+    
     if (!username || !password) {
         return res.status(400).json({ 
             error: "Pseudo et mot de passe requis" 
@@ -307,6 +374,8 @@ app.post("/api/auth/login", async (req, res) => {
     }
     
     try {
+        // ===== TROUVER L'UTILISATEUR =====
+        
         const user = await db.collection("users").findOne({ 
             username: username 
         });
@@ -317,11 +386,15 @@ app.post("/api/auth/login", async (req, res) => {
             });
         }
         
+        // ===== VÉRIFIER SI LE COMPTE EST ACTIF =====
+        
         if (!user.isActive) {
             return res.status(403).json({ 
                 error: "Votre compte a été désactivé. Contactez un administrateur." 
             });
         }
+        
+        // ===== VÉRIFIER LE MOT DE PASSE =====
         
         const passwordValid = await verifyPassword(password, user.passwordHash);
         
@@ -330,6 +403,8 @@ app.post("/api/auth/login", async (req, res) => {
                 error: "Pseudo ou mot de passe incorrect" 
             });
         }
+        
+        // ===== CRÉER UNE SESSION (30 JOURS) =====
         
         const token = generateSessionToken();
         const expiresAt = new Date();
@@ -341,6 +416,8 @@ app.post("/api/auth/login", async (req, res) => {
             createdAt: new Date(),
             expiresAt: expiresAt
         });
+        
+        // ===== METTRE À JOUR LAST_LOGIN =====
         
         await db.collection("users").updateOne(
             { _id: user._id },
@@ -439,6 +516,8 @@ app.post("/api/auth/logout", async (req, res) => {
 app.post("/api/auth/change-password", requireAuth, async (req, res) => {
     const { currentPassword, newPassword, newPasswordConfirm } = req.body;
     
+    // ===== VALIDATIONS =====
+    
     if (!currentPassword || !newPassword || !newPasswordConfirm) {
         return res.status(400).json({ error: "Tous les champs sont requis" });
     }
@@ -460,6 +539,8 @@ app.post("/api/auth/change-password", requireAuth, async (req, res) => {
     }
     
     try {
+        // ===== RÉCUPÉRER L'UTILISATEUR =====
+        
         const user = await db.collection("users").findOne({ 
             _id: req.user.id 
         });
@@ -468,6 +549,8 @@ app.post("/api/auth/change-password", requireAuth, async (req, res) => {
             return res.status(404).json({ error: "Utilisateur introuvable" });
         }
         
+        // ===== VÉRIFIER L'ANCIEN MOT DE PASSE =====
+        
         const passwordValid = await verifyPassword(currentPassword, user.passwordHash);
         
         if (!passwordValid) {
@@ -475,6 +558,8 @@ app.post("/api/auth/change-password", requireAuth, async (req, res) => {
                 error: "Mot de passe actuel incorrect" 
             });
         }
+        
+        // ===== HASHER ET METTRE À JOUR =====
         
         const newPasswordHash = await hashPassword(newPassword);
         
@@ -511,6 +596,7 @@ app.get("/api/auth/account", requireAuth, async (req, res) => {
             return res.status(404).json({ error: "Utilisateur introuvable" });
         }
         
+        // Compter les sessions actives
         const activeSessions = await db.collection("sessions").countDocuments({
             userId: user._id,
             expiresAt: { $gt: new Date() }
@@ -544,7 +630,7 @@ app.post("/api/admin/generate-key", requireAdmin, async (req, res) => {
     try {
         const key = generateRegistrationKey();
         const expiresAt = new Date();
-        const hours = expiresInHours || 24;
+        const hours = expiresInHours || 24; // 24h par défaut
         expiresAt.setHours(expiresAt.getHours() + hours);
         
         await db.collection("registration_keys").insertOne({
@@ -581,10 +667,11 @@ app.get("/api/admin/users", requireAdmin, async (req, res) => {
     try {
         const users = await db.collection("users")
             .find({})
-            .project({ passwordHash: 0 })
+            .project({ passwordHash: 0 }) // Ne pas exposer les hash
             .sort({ createdAt: -1 })
             .toArray();
         
+        // Ajouter le nombre de sessions actives pour chaque user
         for (let user of users) {
             const activeSessions = await db.collection("sessions").countDocuments({
                 userId: user._id,
@@ -617,6 +704,7 @@ app.get("/api/admin/keys", requireAdmin, async (req, res) => {
     try {
         let query = {};
         
+        // Par défaut, ne montrer que les clés non expirées
         if (showExpired !== 'true') {
             query.expiresAt = { $gt: new Date() };
         }
@@ -627,6 +715,7 @@ app.get("/api/admin/keys", requireAdmin, async (req, res) => {
             .limit(100)
             .toArray();
         
+        // Ajouter les usernames pour les clés utilisées
         for (let key of keys) {
             if (key.usedBy) {
                 const user = await db.collection("users").findOne(
@@ -636,6 +725,7 @@ app.get("/api/admin/keys", requireAdmin, async (req, res) => {
                 key.usedByUsername = user ? user.username : 'Utilisateur supprimé';
             }
             
+            // Ajouter le statut
             const now = new Date();
             if (key.used) {
                 key.status = 'used';
@@ -679,6 +769,7 @@ app.delete("/api/admin/revoke/:userId", requireAdmin, async (req, res) => {
             return res.status(404).json({ error: "Utilisateur introuvable" });
         }
         
+        // Supprimer toutes les sessions actives
         await db.collection("sessions").deleteMany({ 
             userId: new ObjectId(userId) 
         });
@@ -750,6 +841,7 @@ app.get("/api/admin/stats", requireAdmin, async (req, res) => {
         });
         const usedKeys = await db.collection("registration_keys").countDocuments({ used: true });
         
+        // Derniers utilisateurs inscrits (5)
         const recentUsers = await db.collection("users")
             .find({})
             .project({ username: 1, createdAt: 1 })
@@ -799,32 +891,148 @@ app.get("/api/admin/dashboard", requireAdmin, (req, res) => {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Admin Dashboard - Wiki SGPI</title>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: 'Courier New', monospace; padding: 20px; background: #0a0a0a; color: #ffa500; line-height: 1.6; }
-        h1 { margin-bottom: 30px; border-bottom: 2px solid #ffa500; padding-bottom: 10px; }
-        .card { background: #1a1a1a; border: 2px solid #ffa500; padding: 20px; margin: 15px 0; border-radius: 8px; }
-        .card h2 { margin-bottom: 15px; color: #ffa500; }
-        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin: 20px 0; }
-        .stat-card { background: #2a2a2a; padding: 15px; border-radius: 5px; text-align: center; }
-        .stat-number { font-size: 2rem; color: #00ff00; font-weight: bold; }
-        .stat-label { color: #888; font-size: 0.9rem; }
-        button { background: #ffa500; color: #000; border: none; padding: 10px 20px; cursor: pointer; margin: 5px; font-family: 'Courier New', monospace; border-radius: 5px; font-weight: bold; }
-        button:hover { background: #ff8800; }
-        button:disabled { background: #555; cursor: not-allowed; }
-        table { width: 100%; border-collapse: collapse; margin-top: 15px; }
-        th, td { border: 1px solid #ffa500; padding: 10px; text-align: left; }
-        th { background: #2a2a2a; font-weight: bold; }
-        tr:hover { background: #2a2a2a; }
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body { 
+            font-family: 'Courier New', monospace; 
+            padding: 20px; 
+            background: #0a0a0a; 
+            color: #ffa500; 
+            line-height: 1.6;
+        }
+        
+        h1 {
+            margin-bottom: 30px;
+            border-bottom: 2px solid #ffa500;
+            padding-bottom: 10px;
+        }
+        
+        .card {
+            background: #1a1a1a;
+            border: 2px solid #ffa500;
+            padding: 20px;
+            margin: 15px 0;
+            border-radius: 8px;
+        }
+        
+        .card h2 {
+            margin-bottom: 15px;
+            color: #ffa500;
+        }
+        
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin: 20px 0;
+        }
+        
+        .stat-card {
+            background: #2a2a2a;
+            padding: 15px;
+            border-radius: 5px;
+            text-align: center;
+        }
+        
+        .stat-number {
+            font-size: 2rem;
+            color: #00ff00;
+            font-weight: bold;
+        }
+        
+        .stat-label {
+            color: #888;
+            font-size: 0.9rem;
+        }
+        
+        button {
+            background: #ffa500;
+            color: #000;
+            border: none;
+            padding: 10px 20px;
+            cursor: pointer;
+            margin: 5px;
+            font-family: 'Courier New', monospace;
+            border-radius: 5px;
+            font-weight: bold;
+        }
+        
+        button:hover {
+            background: #ff8800;
+        }
+        
+        button:disabled {
+            background: #555;
+            cursor: not-allowed;
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 15px;
+        }
+        
+        th, td {
+            border: 1px solid #ffa500;
+            padding: 10px;
+            text-align: left;
+        }
+        
+        th {
+            background: #2a2a2a;
+            font-weight: bold;
+        }
+        
+        tr:hover {
+            background: #2a2a2a;
+        }
+        
         .status-active { color: #00ff00; }
         .status-inactive { color: #ff0000; }
         .status-available { color: #00ff00; }
         .status-used { color: #888; }
         .status-expired { color: #ff0000; }
-        code { background: #2a2a2a; padding: 2px 6px; border-radius: 3px; font-family: 'Courier New', monospace; }
-        .copy-btn { padding: 5px 10px; font-size: 0.8rem; }
-        .new-key-display { background: #2a2a2a; padding: 15px; border-radius: 5px; margin-top: 15px; display: none; }
-        .new-key-display.show { display: block; }
-        .key-highlight { font-size: 1.5rem; color: #00ff00; font-weight: bold; word-break: break-all; }
+        
+        code {
+            background: #2a2a2a;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: 'Courier New', monospace;
+        }
+        
+        .copy-btn {
+            padding: 5px 10px;
+            font-size: 0.8rem;
+        }
+        
+        #loading {
+            text-align: center;
+            padding: 20px;
+            color: #888;
+        }
+        
+        .new-key-display {
+            background: #2a2a2a;
+            padding: 15px;
+            border-radius: 5px;
+            margin-top: 15px;
+            display: none;
+        }
+        
+        .new-key-display.show {
+            display: block;
+        }
+        
+        .key-highlight {
+            font-size: 1.5rem;
+            color: #00ff00;
+            font-weight: bold;
+            word-break: break-all;
+        }
     </style>
 </head>
 <body>
@@ -835,10 +1043,22 @@ app.get("/api/admin/dashboard", requireAdmin, (req, res) => {
         <div id="stats-loading">Chargement...</div>
         <div id="stats-content" style="display: none;">
             <div class="stats-grid">
-                <div class="stat-card"><div class="stat-number" id="stat-users-total">0</div><div class="stat-label">Utilisateurs</div></div>
-                <div class="stat-card"><div class="stat-number" id="stat-users-active">0</div><div class="stat-label">Actifs</div></div>
-                <div class="stat-card"><div class="stat-number" id="stat-sessions">0</div><div class="stat-label">Sessions actives</div></div>
-                <div class="stat-card"><div class="stat-number" id="stat-keys-available">0</div><div class="stat-label">Clés disponibles</div></div>
+                <div class="stat-card">
+                    <div class="stat-number" id="stat-users-total">0</div>
+                    <div class="stat-label">Utilisateurs</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number" id="stat-users-active">0</div>
+                    <div class="stat-label">Actifs</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number" id="stat-sessions">0</div>
+                    <div class="stat-label">Sessions actives</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number" id="stat-keys-available">0</div>
+                    <div class="stat-label">Clés disponibles</div>
+                </div>
             </div>
         </div>
     </div>
@@ -866,104 +1086,777 @@ app.get("/api/admin/dashboard", requireAdmin, (req, res) => {
         const ADMIN_KEY = '${adminKey}';
         const API_URL = window.location.origin;
         
+        // Charger les stats
         async function loadStats() {
             try {
                 const res = await fetch(\`\${API_URL}/api/admin/stats?admin_key=\${ADMIN_KEY}\`);
                 const data = await res.json();
+                
                 document.getElementById('stat-users-total').textContent = data.stats.users.total;
                 document.getElementById('stat-users-active').textContent = data.stats.users.active;
                 document.getElementById('stat-sessions').textContent = data.stats.sessions.active;
                 document.getElementById('stat-keys-available').textContent = data.stats.keys.available;
+                
                 document.getElementById('stats-loading').style.display = 'none';
                 document.getElementById('stats-content').style.display = 'block';
-            } catch (err) { console.error('Erreur stats:', err); }
+            } catch (err) {
+                console.error('Erreur stats:', err);
+            }
         }
         
+        // Générer une clé
         async function generateKey() {
             try {
                 const res = await fetch(\`\${API_URL}/api/admin/generate-key\`, {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'x-admin-key': ADMIN_KEY },
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'x-admin-key': ADMIN_KEY
+                    },
                     body: JSON.stringify({ generatedBy: 'dashboard' })
                 });
+                
                 const data = await res.json();
+                
                 const keyDiv = document.getElementById('new-key');
                 keyDiv.className = 'new-key-display show';
-                keyDiv.innerHTML = \`<div><strong style="color: #00ff00;">✅ Clé générée !</strong><br><br><div class="key-highlight">\${data.key}</div><br><button class="copy-btn" onclick="copyToClipboard('\${data.key}')">📋 Copier</button><br><br><small style="color: #888;">Expire : \${new Date(data.expiresAt).toLocaleString('fr-FR')}<br>Valide : \${data.expiresIn}</small></div>\`;
-                loadStats(); loadKeys(false);
-            } catch (err) { alert('Erreur : ' + err.message); }
+                keyDiv.innerHTML = \`
+                    <div>
+                        <strong style="color: #00ff00;">✅ Clé générée avec succès !</strong><br><br>
+                        <div class="key-highlight">\${data.key}</div><br>
+                        <button class="copy-btn" onclick="copyToClipboard('\${data.key}')">📋 Copier la clé</button><br><br>
+                        <small style="color: #888;">
+                            Expire le : \${new Date(data.expiresAt).toLocaleString('fr-FR')}<br>
+                            Valide pendant : \${data.expiresIn}
+                        </small>
+                    </div>
+                \`;
+                
+                loadStats();
+                loadKeys(false);
+                
+            } catch (err) {
+                alert('Erreur génération clé: ' + err.message);
+            }
         }
         
+        // Copier dans le presse-papier
         function copyToClipboard(text) {
-            navigator.clipboard.writeText(text).then(() => alert('✅ Clé copiée !'));
+            navigator.clipboard.writeText(text).then(() => {
+                alert('✅ Clé copiée dans le presse-papier !');
+            });
         }
         
+        // Charger les utilisateurs
         async function loadUsers() {
             try {
                 const res = await fetch(\`\${API_URL}/api/admin/users?admin_key=\${ADMIN_KEY}\`);
                 const data = await res.json();
-                let html = '<table><thead><tr><th>Pseudo</th><th>Créé le</th><th>Dernière connexion</th><th>Sessions</th><th>Statut</th><th>Actions</th></tr></thead><tbody>';
+                
+                let html = \`
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Pseudo</th>
+                                <th>Créé le</th>
+                                <th>Dernière connexion</th>
+                                <th>Sessions</th>
+                                <th>Statut</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                \`;
+                
                 data.users.forEach(u => {
                     const createdDate = new Date(u.createdAt).toLocaleDateString('fr-FR');
                     const lastLogin = u.lastLogin ? new Date(u.lastLogin).toLocaleDateString('fr-FR') : 'Jamais';
                     const statusClass = u.isActive ? 'status-active' : 'status-inactive';
                     const statusText = u.isActive ? '✅ Actif' : '❌ Inactif';
-                    html += \`<tr><td><strong>\${u.username}</strong></td><td>\${createdDate}</td><td>\${lastLogin}</td><td>\${u.activeSessions || 0}</td><td class="\${statusClass}">\${statusText}</td><td>\${u.isActive ? \`<button onclick="revokeUser('\${u._id}', '\${u.username}')">Révoquer</button>\` : \`<button onclick="reactivateUser('\${u._id}', '\${u.username}')">Réactiver</button>\`}</td></tr>\`;
+                    
+                    html += \`
+                        <tr>
+                            <td><strong>\${u.username}</strong></td>
+                            <td>\${createdDate}</td>
+                            <td>\${lastLogin}</td>
+                            <td>\${u.activeSessions || 0}</td>
+                            <td class="\${statusClass}">\${statusText}</td>
+                            <td>
+                                \${u.isActive ? 
+                                    \`<button onclick="revokeUser('\${u._id}', '\${u.username}')">Révoquer</button>\` : 
+                                    \`<button onclick="reactivateUser('\${u._id}', '\${u.username}')">Réactiver</button>\`
+                                }
+                            </td>
+                        </tr>
+                    \`;
                 });
-                html += \`</tbody></table><p style="margin-top: 10px; color: #888;">Total: \${data.total} (\${data.active} actifs, \${data.inactive} inactifs)</p>\`;
+                
+                html += \`
+                        </tbody>
+                    </table>
+                    <p style="margin-top: 10px; color: #888;">
+                        Total: \${data.total} utilisateurs (\${data.active} actifs, \${data.inactive} inactifs)
+                    </p>
+                \`;
+                
                 document.getElementById('users-list').innerHTML = html;
-            } catch (err) { document.getElementById('users-list').innerHTML = '<p style="color: #ff0000;">Erreur</p>'; }
+                
+            } catch (err) {
+                document.getElementById('users-list').innerHTML = '<p style="color: #ff0000;">Erreur de chargement</p>';
+            }
         }
         
+        // Charger les clés
         async function loadKeys(showExpired) {
             try {
-                const res = await fetch(\`\${API_URL}/api/admin/keys?admin_key=\${ADMIN_KEY}&showExpired=\${showExpired}\`);
+                const url = \`\${API_URL}/api/admin/keys?admin_key=\${ADMIN_KEY}&showExpired=\${showExpired}\`;
+                const res = await fetch(url);
                 const data = await res.json();
-                let html = '<table><thead><tr><th>Clé</th><th>Généré le</th><th>Expire le</th><th>Statut</th><th>Utilisée par</th></tr></thead><tbody>';
+                
+                let html = \`
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Clé</th>
+                                <th>Généré le</th>
+                                <th>Expire le</th>
+                                <th>Statut</th>
+                                <th>Utilisée par</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                \`;
+                
                 data.keys.forEach(k => {
                     const generatedDate = new Date(k.generatedAt).toLocaleString('fr-FR');
                     const expiresDate = new Date(k.expiresAt).toLocaleString('fr-FR');
-                    let statusClass = '', statusText = '';
-                    if (k.status === 'available') { statusClass = 'status-available'; statusText = '✅ Disponible'; }
-                    else if (k.status === 'used') { statusClass = 'status-used'; statusText = '✓ Utilisée'; }
-                    else { statusClass = 'status-expired'; statusText = '❌ Expirée'; }
-                    html += \`<tr><td><code>\${k.key}</code></td><td>\${generatedDate}</td><td>\${expiresDate}</td><td class="\${statusClass}">\${statusText}</td><td>\${k.usedByUsername || '-'}</td></tr>\`;
+                    
+                    let statusClass = '';
+                    let statusText = '';
+                    
+                    if (k.status === 'available') {
+                        statusClass = 'status-available';
+                        statusText = '✅ Disponible';
+                    } else if (k.status === 'used') {
+                        statusClass = 'status-used';
+                        statusText = '✓ Utilisée';
+                    } else {
+                        statusClass = 'status-expired';
+                        statusText = '❌ Expirée';
+                    }
+                    
+                    html += \`
+                        <tr>
+                            <td><code>\${k.key}</code></td>
+                            <td>\${generatedDate}</td>
+                            <td>\${expiresDate}</td>
+                            <td class="\${statusClass}">\${statusText}</td>
+                            <td>\${k.usedByUsername || '-'}</td>
+                        </tr>
+                    \`;
                 });
-                html += \`</tbody></table><p style="margin-top: 10px; color: #888;">\${data.available} disponibles • \${data.used} utilisées • \${data.expired} expirées</p>\`;
+                
+                html += \`
+                        </tbody>
+                    </table>
+                    <p style="margin-top: 10px; color: #888;">
+                        \${data.available} disponibles • \${data.used} utilisées • \${data.expired} expirées
+                    </p>
+                \`;
+                
                 document.getElementById('keys-list').innerHTML = html;
-            } catch (err) { document.getElementById('keys-list').innerHTML = '<p style="color: #ff0000;">Erreur</p>'; }
+                
+            } catch (err) {
+                document.getElementById('keys-list').innerHTML = '<p style="color: #ff0000;">Erreur de chargement</p>';
+            }
         }
         
+        // Révoquer un utilisateur
         async function revokeUser(userId, username) {
-            if (!confirm(\`Révoquer "\${username}" ?\\n\\nSupprimera toutes ses sessions.\`)) return;
+            if (!confirm(\`Révoquer le compte de "\${username}" ?\\n\\nCette action supprimera toutes ses sessions actives.\`)) {
+                return;
+            }
+            
             try {
-                const res = await fetch(\`\${API_URL}/api/admin/revoke/\${userId}\`, { method: 'DELETE', headers: { 'x-admin-key': ADMIN_KEY } });
+                const res = await fetch(\`\${API_URL}/api/admin/revoke/\${userId}\`, {
+                    method: 'DELETE',
+                    headers: { 'x-admin-key': ADMIN_KEY }
+                });
+                
                 const data = await res.json();
-                alert(data.message || 'Révoqué');
-                loadUsers(); loadStats();
-            } catch (err) { alert('Erreur: ' + err.message); }
+                alert(data.message || 'Compte révoqué');
+                loadUsers();
+                loadStats();
+                
+            } catch (err) {
+                alert('Erreur: ' + err.message);
+            }
         }
         
+        // Réactiver un utilisateur
         async function reactivateUser(userId, username) {
-            if (!confirm(\`Réactiver "\${username}" ?\`)) return;
+            if (!confirm(\`Réactiver le compte de "\${username}" ?\`)) {
+                return;
+            }
+            
             try {
-                const res = await fetch(\`\${API_URL}/api/admin/reactivate/\${userId}\`, { method: 'POST', headers: { 'x-admin-key': ADMIN_KEY } });
+                const res = await fetch(\`\${API_URL}/api/admin/reactivate/\${userId}\`, {
+                    method: 'POST',
+                    headers: { 'x-admin-key': ADMIN_KEY }
+                });
+                
                 const data = await res.json();
-                alert(data.message || 'Réactivé');
-                loadUsers(); loadStats();
-            } catch (err) { alert('Erreur: ' + err.message); }
+                alert(data.message || 'Compte réactivé');
+                loadUsers();
+                loadStats();
+                
+            } catch (err) {
+                alert('Erreur: ' + err.message);
+            }
         }
         
-        loadStats(); loadUsers(); loadKeys(false);
-        setInterval(() => { loadStats(); }, 30000);
+        // Chargement initial
+        loadStats();
+        loadUsers();
+        loadKeys(false);
+        
+        // Auto-refresh toutes les 30 secondes
+        setInterval(() => {
+            loadStats();
+        }, 30000);
     </script>
 </body>
 </html>
     `);
 });
 
+
 // ===================================
-// HEALTH CHECK & 404
+// PANEL ADMIN - CATÉGORIES
+// ===================================
+
+// Lister toutes les catégories
+app.get("/api/admin/categories", requireAdmin, async (req, res) => {
+    try {
+        const categories = await db.collection("categories")
+            .find({})
+            .sort({ order: 1 })
+            .toArray();
+        
+        // Ajouter le nombre de sections et liens pour chaque catégorie
+        for (let cat of categories) {
+            const linksCount = await db.collection("links").countDocuments({ 
+                categoryId: cat._id.toString() 
+            });
+            cat.linksCount = linksCount;
+            cat.sectionsCount = cat.sections ? cat.sections.length : 0;
+        }
+        
+        res.json({ success: true, categories });
+    } catch (err) {
+        console.error('❌ Erreur liste catégories:', err);
+        res.status(500).json({ error: "Erreur serveur" });
+    }
+});
+
+// Créer une catégorie
+app.post("/api/admin/categories", requireAdmin, async (req, res) => {
+    const { name, emoji, slug } = req.body;
+    
+    if (!name || !emoji || !slug) {
+        return res.status(400).json({ error: "Nom, emoji et slug requis" });
+    }
+    
+    try {
+        // Trouver l'ordre max actuel
+        const maxCategory = await db.collection("categories")
+            .find({})
+            .sort({ order: -1 })
+            .limit(1)
+            .toArray();
+        
+        const newOrder = maxCategory.length > 0 ? maxCategory[0].order + 1 : 0;
+        
+        const newCategory = {
+            name: name,
+            emoji: emoji,
+            slug: slug,
+            order: newOrder,
+            sections: [],
+            createdAt: new Date()
+        };
+        
+        const result = await db.collection("categories").insertOne(newCategory);
+        
+        // Log
+        await db.collection("admin_logs").insertOne({
+            action: "create_category",
+            target: name,
+            targetId: result.insertedId.toString(),
+            timestamp: new Date()
+        });
+        
+        console.log(`✅ Catégorie créée : ${name}`);
+        res.json({ success: true, category: { ...newCategory, _id: result.insertedId } });
+    } catch (err) {
+        console.error('❌ Erreur création catégorie:', err);
+        res.status(500).json({ error: "Erreur serveur" });
+    }
+});
+
+// Modifier une catégorie
+app.put("/api/admin/categories/:id", requireAdmin, async (req, res) => {
+    const { id } = req.params;
+    const { name, emoji, slug } = req.body;
+    
+    try {
+        const result = await db.collection("categories").findOneAndUpdate(
+            { _id: new ObjectId(id) },
+            { $set: { name, emoji, slug } },
+            { returnDocument: 'after' }
+        );
+        
+        if (!result) {
+            return res.status(404).json({ error: "Catégorie introuvable" });
+        }
+        
+        await db.collection("admin_logs").insertOne({
+            action: "update_category",
+            target: name,
+            targetId: id,
+            timestamp: new Date()
+        });
+        
+        console.log(`✅ Catégorie modifiée : ${name}`);
+        res.json({ success: true, category: result });
+    } catch (err) {
+        console.error('❌ Erreur modification catégorie:', err);
+        res.status(500).json({ error: "Erreur serveur" });
+    }
+});
+
+// Supprimer une catégorie
+app.delete("/api/admin/categories/:id", requireAdmin, async (req, res) => {
+    const { id } = req.params;
+    
+    try {
+        const category = await db.collection("categories").findOne({ _id: new ObjectId(id) });
+        
+        if (!category) {
+            return res.status(404).json({ error: "Catégorie introuvable" });
+        }
+        
+        // Supprimer tous les liens de cette catégorie
+        await db.collection("links").deleteMany({ categoryId: id });
+        
+        // Supprimer la catégorie
+        await db.collection("categories").deleteOne({ _id: new ObjectId(id) });
+        
+        await db.collection("admin_logs").insertOne({
+            action: "delete_category",
+            target: category.name,
+            targetId: id,
+            timestamp: new Date()
+        });
+        
+        console.log(`❌ Catégorie supprimée : ${category.name}`);
+        res.json({ success: true, message: "Catégorie supprimée" });
+    } catch (err) {
+        console.error('❌ Erreur suppression catégorie:', err);
+        res.status(500).json({ error: "Erreur serveur" });
+    }
+});
+
+// Réorganiser les catégories
+app.post("/api/admin/categories/reorder", requireAdmin, async (req, res) => {
+    const { categoryIds } = req.body;
+    
+    if (!Array.isArray(categoryIds)) {
+        return res.status(400).json({ error: "categoryIds doit être un tableau" });
+    }
+    
+    try {
+        for (let i = 0; i < categoryIds.length; i++) {
+            await db.collection("categories").updateOne(
+                { _id: new ObjectId(categoryIds[i]) },
+                { $set: { order: i } }
+            );
+        }
+        
+        await db.collection("admin_logs").insertOne({
+            action: "reorder_categories",
+            target: "categories",
+            timestamp: new Date()
+        });
+        
+        console.log(`✅ Catégories réorganisées`);
+        res.json({ success: true, message: "Catégories réorganisées" });
+    } catch (err) {
+        console.error('❌ Erreur réorganisation:', err);
+        res.status(500).json({ error: "Erreur serveur" });
+    }
+});
+
+// ===================================
+// PANEL ADMIN - SECTIONS
+// ===================================
+
+// Ajouter une section à une catégorie
+app.post("/api/admin/categories/:id/sections", requireAdmin, async (req, res) => {
+    const { id } = req.params;
+    const { name } = req.body;
+    
+    if (!name) {
+        return res.status(400).json({ error: "Nom de section requis" });
+    }
+    
+    try {
+        const category = await db.collection("categories").findOne({ _id: new ObjectId(id) });
+        
+        if (!category) {
+            return res.status(404).json({ error: "Catégorie introuvable" });
+        }
+        
+        const sections = category.sections || [];
+        const newSection = {
+            id: crypto.randomBytes(8).toString('hex'),
+            name: name,
+            order: sections.length
+        };
+        
+        sections.push(newSection);
+        
+        await db.collection("categories").updateOne(
+            { _id: new ObjectId(id) },
+            { $set: { sections: sections } }
+        );
+        
+        await db.collection("admin_logs").insertOne({
+            action: "create_section",
+            target: name,
+            categoryId: id,
+            timestamp: new Date()
+        });
+        
+        console.log(`✅ Section créée : ${name} dans ${category.name}`);
+        res.json({ success: true, section: newSection });
+    } catch (err) {
+        console.error('❌ Erreur création section:', err);
+        res.status(500).json({ error: "Erreur serveur" });
+    }
+});
+
+// Modifier une section
+app.put("/api/admin/categories/:catId/sections/:sectionId", requireAdmin, async (req, res) => {
+    const { catId, sectionId } = req.params;
+    const { name } = req.body;
+    
+    try {
+        const category = await db.collection("categories").findOne({ _id: new ObjectId(catId) });
+        
+        if (!category) {
+            return res.status(404).json({ error: "Catégorie introuvable" });
+        }
+        
+        const sections = category.sections || [];
+        const sectionIndex = sections.findIndex(s => s.id === sectionId);
+        
+        if (sectionIndex === -1) {
+            return res.status(404).json({ error: "Section introuvable" });
+        }
+        
+        sections[sectionIndex].name = name;
+        
+        await db.collection("categories").updateOne(
+            { _id: new ObjectId(catId) },
+            { $set: { sections: sections } }
+        );
+        
+        await db.collection("admin_logs").insertOne({
+            action: "update_section",
+            target: name,
+            categoryId: catId,
+            timestamp: new Date()
+        });
+        
+        console.log(`✅ Section modifiée : ${name}`);
+        res.json({ success: true, section: sections[sectionIndex] });
+    } catch (err) {
+        console.error('❌ Erreur modification section:', err);
+        res.status(500).json({ error: "Erreur serveur" });
+    }
+});
+
+// Supprimer une section
+app.delete("/api/admin/categories/:catId/sections/:sectionId", requireAdmin, async (req, res) => {
+    const { catId, sectionId } = req.params;
+    
+    try {
+        const category = await db.collection("categories").findOne({ _id: new ObjectId(catId) });
+        
+        if (!category) {
+            return res.status(404).json({ error: "Catégorie introuvable" });
+        }
+        
+        const sections = category.sections || [];
+        const updatedSections = sections.filter(s => s.id !== sectionId);
+        
+        // Supprimer tous les liens de cette section
+        await db.collection("links").deleteMany({ 
+            categoryId: catId,
+            sectionId: sectionId
+        });
+        
+        await db.collection("categories").updateOne(
+            { _id: new ObjectId(catId) },
+            { $set: { sections: updatedSections } }
+        );
+        
+        await db.collection("admin_logs").insertOne({
+            action: "delete_section",
+            categoryId: catId,
+            sectionId: sectionId,
+            timestamp: new Date()
+        });
+        
+        console.log(`❌ Section supprimée`);
+        res.json({ success: true, message: "Section supprimée" });
+    } catch (err) {
+        console.error('❌ Erreur suppression section:', err);
+        res.status(500).json({ error: "Erreur serveur" });
+    }
+});
+
+// Réorganiser les sections
+app.post("/api/admin/categories/:catId/sections/reorder", requireAdmin, async (req, res) => {
+    const { catId } = req.params;
+    const { sectionIds } = req.body;
+    
+    if (!Array.isArray(sectionIds)) {
+        return res.status(400).json({ error: "sectionIds doit être un tableau" });
+    }
+    
+    try {
+        const category = await db.collection("categories").findOne({ _id: new ObjectId(catId) });
+        
+        if (!category) {
+            return res.status(404).json({ error: "Catégorie introuvable" });
+        }
+        
+        const sections = category.sections || [];
+        
+        // Réorganiser les sections selon le nouvel ordre
+        const reorderedSections = sectionIds.map((id, index) => {
+            const section = sections.find(s => s.id === id);
+            if (section) {
+                section.order = index;
+                return section;
+            }
+        }).filter(Boolean);
+        
+        await db.collection("categories").updateOne(
+            { _id: new ObjectId(catId) },
+            { $set: { sections: reorderedSections } }
+        );
+        
+        await db.collection("admin_logs").insertOne({
+            action: "reorder_sections",
+            categoryId: catId,
+            timestamp: new Date()
+        });
+        
+        console.log(`✅ Sections réorganisées`);
+        res.json({ success: true, message: "Sections réorganisées" });
+    } catch (err) {
+        console.error('❌ Erreur réorganisation sections:', err);
+        res.status(500).json({ error: "Erreur serveur" });
+    }
+});
+
+// ===================================
+// PANEL ADMIN - LIENS
+// ===================================
+
+// Lister les liens d'une catégorie/section
+app.get("/api/admin/links", requireAdmin, async (req, res) => {
+    const { categoryId, sectionId } = req.query;
+    
+    try {
+        let query = {};
+        if (categoryId) query.categoryId = categoryId;
+        if (sectionId) query.sectionId = sectionId;
+        
+        const links = await db.collection("links")
+            .find(query)
+            .sort({ order: 1 })
+            .toArray();
+        
+        res.json({ success: true, links });
+    } catch (err) {
+        console.error('❌ Erreur liste liens:', err);
+        res.status(500).json({ error: "Erreur serveur" });
+    }
+});
+
+// Créer un lien
+app.post("/api/admin/links", requireAdmin, async (req, res) => {
+    const { categoryId, sectionId, name, url, description, badge } = req.body;
+    
+    if (!categoryId || !sectionId || !name || !url) {
+        return res.status(400).json({ error: "Catégorie, section, nom et URL requis" });
+    }
+    
+    try {
+        // Trouver l'ordre max actuel dans cette section
+        const maxLink = await db.collection("links")
+            .find({ categoryId, sectionId })
+            .sort({ order: -1 })
+            .limit(1)
+            .toArray();
+        
+        const newOrder = maxLink.length > 0 ? maxLink[0].order + 1 : 0;
+        
+        const newLink = {
+            categoryId,
+            sectionId,
+            name,
+            url,
+            description: description || "",
+            badge: badge || "",
+            order: newOrder,
+            createdAt: new Date()
+        };
+        
+        const result = await db.collection("links").insertOne(newLink);
+        
+        await db.collection("admin_logs").insertOne({
+            action: "create_link",
+            target: name,
+            targetId: result.insertedId.toString(),
+            timestamp: new Date()
+        });
+        
+        console.log(`✅ Lien créé : ${name}`);
+        res.json({ success: true, link: { ...newLink, _id: result.insertedId } });
+    } catch (err) {
+        console.error('❌ Erreur création lien:', err);
+        res.status(500).json({ error: "Erreur serveur" });
+    }
+});
+
+// Modifier un lien
+app.put("/api/admin/links/:id", requireAdmin, async (req, res) => {
+    const { id } = req.params;
+    const { name, url, description, badge } = req.body;
+    
+    try {
+        const result = await db.collection("links").findOneAndUpdate(
+            { _id: new ObjectId(id) },
+            { $set: { name, url, description, badge } },
+            { returnDocument: 'after' }
+        );
+        
+        if (!result) {
+            return res.status(404).json({ error: "Lien introuvable" });
+        }
+        
+        await db.collection("admin_logs").insertOne({
+            action: "update_link",
+            target: name,
+            targetId: id,
+            timestamp: new Date()
+        });
+        
+        console.log(`✅ Lien modifié : ${name}`);
+        res.json({ success: true, link: result });
+    } catch (err) {
+        console.error('❌ Erreur modification lien:', err);
+        res.status(500).json({ error: "Erreur serveur" });
+    }
+});
+
+// Supprimer un lien
+app.delete("/api/admin/links/:id", requireAdmin, async (req, res) => {
+    const { id } = req.params;
+    
+    try {
+        const link = await db.collection("links").findOne({ _id: new ObjectId(id) });
+        
+        if (!link) {
+            return res.status(404).json({ error: "Lien introuvable" });
+        }
+        
+        await db.collection("links").deleteOne({ _id: new ObjectId(id) });
+        
+        await db.collection("admin_logs").insertOne({
+            action: "delete_link",
+            target: link.name,
+            targetId: id,
+            timestamp: new Date()
+        });
+        
+        console.log(`❌ Lien supprimé : ${link.name}`);
+        res.json({ success: true, message: "Lien supprimé" });
+    } catch (err) {
+        console.error('❌ Erreur suppression lien:', err);
+        res.status(500).json({ error: "Erreur serveur" });
+    }
+});
+
+// Réorganiser les liens
+app.post("/api/admin/links/reorder", requireAdmin, async (req, res) => {
+    const { linkIds } = req.body;
+    
+    if (!Array.isArray(linkIds)) {
+        return res.status(400).json({ error: "linkIds doit être un tableau" });
+    }
+    
+    try {
+        for (let i = 0; i < linkIds.length; i++) {
+            await db.collection("links").updateOne(
+                { _id: new ObjectId(linkIds[i]) },
+                { $set: { order: i } }
+            );
+        }
+        
+        await db.collection("admin_logs").insertOne({
+            action: "reorder_links",
+            target: "links",
+            timestamp: new Date()
+        });
+        
+        console.log(`✅ Liens réorganisés`);
+        res.json({ success: true, message: "Liens réorganisés" });
+    } catch (err) {
+        console.error('❌ Erreur réorganisation liens:', err);
+        res.status(500).json({ error: "Erreur serveur" });
+    }
+});
+
+// ===================================
+// PANEL ADMIN - LOGS
+// ===================================
+
+// Récupérer les logs
+app.get("/api/admin/logs", requireAdmin, async (req, res) => {
+    const { limit = 50 } = req.query;
+    
+    try {
+        const logs = await db.collection("admin_logs")
+            .find({})
+            .sort({ timestamp: -1 })
+            .limit(parseInt(limit))
+            .toArray();
+        
+        res.json({ success: true, logs });
+    } catch (err) {
+        console.error('❌ Erreur récupération logs:', err);
+        res.status(500).json({ error: "Erreur serveur" });
+    }
+});
+
+// ===================================
+// HEALTH CHECK
 // ===================================
 
 app.get("/health", (req, res) => {
@@ -973,6 +1866,10 @@ app.get("/health", (req, res) => {
         mongodb: db ? "connected" : "disconnected"
     });
 });
+
+// ===================================
+// 404 HANDLER
+// ===================================
 
 app.use((req, res) => {
     res.status(404).json({ 
