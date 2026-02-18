@@ -1332,6 +1332,70 @@ app.get("/api/admin/dashboard", requireAdmin, (req, res) => {
 
 
 // ===================================
+// PUBLIC ENDPOINTS - CATÉGORIES (sans authentification)
+// ===================================
+
+// Lister toutes les catégories (PUBLIC - pas besoin d'admin key)
+app.get("/api/categories", async (req, res) => {
+    try {
+        const categories = await db.collection("categories")
+            .find({})
+            .sort({ order: 1 })
+            .toArray();
+        
+        // Ajouter le nombre de sections et liens pour chaque catégorie
+        for (let cat of categories) {
+            const linksCount = await db.collection("links").countDocuments({ 
+                categoryId: cat._id.toString() 
+            });
+            cat.linksCount = linksCount;
+            cat.sectionsCount = cat.sections ? cat.sections.length : 0;
+        }
+        
+        res.json({ success: true, categories });
+    } catch (err) {
+        console.error('❌ Erreur liste catégories:', err);
+        res.status(500).json({ error: "Erreur serveur" });
+    }
+});
+
+// Récupérer une catégorie avec ses sections et liens (PUBLIC)
+app.get("/api/categories/:slug", async (req, res) => {
+    const { slug } = req.params;
+    
+    try {
+        const category = await db.collection("categories").findOne({ slug: slug });
+        
+        if (!category) {
+            return res.status(404).json({ error: "Catégorie introuvable" });
+        }
+        
+        // Récupérer tous les liens de cette catégorie
+        const links = await db.collection("links")
+            .find({ categoryId: category._id.toString() })
+            .sort({ order: 1 })
+            .toArray();
+        
+        // Grouper les liens par section
+        const sections = category.sections || [];
+        for (let section of sections) {
+            section.links = links.filter(l => l.sectionId === section.id);
+        }
+        
+        res.json({ 
+            success: true, 
+            category: {
+                ...category,
+                sections: sections
+            }
+        });
+    } catch (err) {
+        console.error('❌ Erreur récupération catégorie:', err);
+        res.status(500).json({ error: "Erreur serveur" });
+    }
+});
+
+// ===================================
 // PANEL ADMIN - CATÉGORIES
 // ===================================
 
