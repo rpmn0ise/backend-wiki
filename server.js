@@ -103,34 +103,66 @@ process.on('SIGINT', async () => {
 // ===================================
 
 // ===================================
-// PROXY CORS POUR NEOCITIES
+// CORS CONFIGURATION CORRIGÉE
 // ===================================
 
-// Middleware pour autoriser TOUTES les origines (temporaire pour debug)
+const allowedOrigins = [
+    'https://rpmn0ise.neocities.org',
+    'https://sgpi-wiki-frontend.onrender.com',
+    'http://localhost:3000',
+    'http://localhost:5500',
+    'http://127.0.0.1:5500'
+];
+
+// 1. Configuration CORS avec le package (gère automatiquement les OPTIONS)
+app.use(cors({
+    origin: function (origin, callback) {
+        // Autoriser requêtes sans origin (Postman, server-to-server)
+        if (!origin) return callback(null, true);
+        
+        // Autoriser sous-domaines Neocities
+        if (origin.endsWith('.neocities.org')) {
+            return callback(null, true);
+        }
+        
+        // Vérifier liste autorisée
+        if (allowedOrigins.includes(origin)) {
+            return callback(null, true);
+        }
+        
+        // Permissif pour dev (mettre false en prod si tu veux bloquer)
+        return callback(null, true);
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Admin-Key'],
+    optionsSuccessStatus: 204
+}));
+
+// 2. Parser JSON APRÈS CORS
+app.use(express.json());
+
+// 3. Headers CORS additionnels (pas de return ici !)
 app.use((req, res, next) => {
-    res.header('Access-Control-Allow-Origin', '*');
+    const origin = req.headers.origin;
+    
+    if (origin) {
+        if (allowedOrigins.includes(origin) || origin.endsWith('.neocities.org')) {
+            res.header('Access-Control-Allow-Origin', origin);
+            res.header('Access-Control-Allow-Credentials', 'true');
+        }
+    }
+    
     res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
     res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Admin-Key');
     
-    if (req.method === 'OPTIONS') {
-        return res.sendStatus(200);
-    }
-    
-    next();
+    // ⚠️ PAS DE return res.sendStatus() ICI !
+    next(); // ← Toujours appeler next()
 });
 
-app.use(cors({
-    origin: '*', // Accepte TOUTES les origines
-    credentials: false, // Important : mettre à false avec origin: '*'
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Admin-Key']
-}));
-
-app.use(express.json());
-
-// Logging middleware (utile pour debug)
+// 4. Logging
 app.use((req, res, next) => {
-    console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.path} - Origin: ${req.headers.origin || 'none'}`);
     next();
 });
 
@@ -1915,205 +1947,6 @@ app.get("/api/admin/logs", requireAdmin, async (req, res) => {
         res.json({ success: true, logs });
     } catch (err) {
         console.error('❌ Erreur récupération logs:', err);
-        res.status(500).json({ error: "Erreur serveur" });
-    }
-});
-
-// ===================================
-// PANEL ADMIN - CRÉATION RAPIDE
-// ===================================
-
-// Ajout rapide de plusieurs liens en une fois
-app.post("/api/admin/quick-add", requireAdmin, async (req, res) => {
-    const { categoryId, sectionId, links } = req.body;
-    
-    if (!categoryId || !sectionId || !Array.isArray(links) || links.length === 0) {
-        return res.status(400).json({ 
-            error: "categoryId, sectionId et tableau de liens requis" 
-        });
-    }
-    
-    try {
-        // Trouver l'ordre max actuel dans cette section
-        const maxLink = await db.collection("links")
-            .find({ categoryId, sectionId })
-            .sort({ order: -1 })
-            .limit(1)
-            .toArray();
-        
-        let currentOrder = maxLink.length > 0 ? maxLink[0].order + 1 : 0;
-        
-        const insertedLinks = [];
-        
-        // Créer tous les liens
-        for (const link of links) {
-            if (!link.name || !link.url) {
-                continue; // Skip les liens incomplets
-            }
-            
-            const newLink = {
-                categoryId,
-                sectionId,
-                name: link.name.trim(),
-                url: link.url.trim(),
-                description: link.description?.trim() || "",
-                badge: link.badge?.trim() || "",
-                order: currentOrder++,
-                createdAt: new Date()
-            };
-            
-            const result = await db.collection("links").insertOne(newLink);
-            insertedLinks.push({ ...newLink, _id: result.insertedId });
-        }
-        
-        // Log
-        await db.collection("admin_logs").insertOne({
-            action: "quick_add_links",
-            target: `${insertedLinks.length} liens`,
-            categoryId: categoryId,
-            sectionId: sectionId,
-            timestamp: new Date()
-        });
-        
-        console.log(`✅ Ajout rapide : ${insertedLinks.length} liens créés`);
-        res.json({ 
-            success: true, 
-            message: `${insertedLinks.length} liens ajoutés`,
-            links: insertedLinks 
-        });
-        
-    } catch (err) {
-        console.error('❌ Erreur ajout rapide:', err);
-        res.status(500).json({ error: "Erreur serveur" });
-    }
-});
-
-// Dupliquer une catégorie (structure uniquement, sans les liens)
-app.post("/api/admin/categories/:id/duplicate", requireAdmin, async (req, res) => {
-    const { id } = req.params;
-    const { newName, newEmoji, newSlug } = req.body;
-    
-    if (!newName || !newEmoji || !newSlug) {
-        return res.status(400).json({ 
-            error: "Nouveau nom, emoji et slug requis" 
-        });
-    }
-    
-    try {
-        const originalCategory = await db.collection("categories").findOne({ 
-            _id: new ObjectId(id) 
-        });
-        
-        if (!originalCategory) {
-            return res.status(404).json({ error: "Catégorie introuvable" });
-        }
-        
-        // Trouver l'ordre max actuel
-        const maxCategory = await db.collection("categories")
-            .find({})
-            .sort({ order: -1 })
-            .limit(1)
-            .toArray();
-        
-        const newOrder = maxCategory.length > 0 ? maxCategory[0].order + 1 : 0;
-        
-        // Créer la nouvelle catégorie avec les mêmes sections
-        const newCategory = {
-            name: newName,
-            emoji: newEmoji,
-            slug: newSlug,
-            order: newOrder,
-            sections: originalCategory.sections || [], // Copie les sections
-            createdAt: new Date()
-        };
-        
-        const result = await db.collection("categories").insertOne(newCategory);
-        
-        // Log
-        await db.collection("admin_logs").insertOne({
-            action: "duplicate_category",
-            target: `${originalCategory.name} → ${newName}`,
-            targetId: result.insertedId.toString(),
-            timestamp: new Date()
-        });
-        
-        console.log(`✅ Catégorie dupliquée : ${originalCategory.name} → ${newName}`);
-        res.json({ 
-            success: true, 
-            message: "Catégorie dupliquée avec succès",
-            category: { ...newCategory, _id: result.insertedId } 
-        });
-        
-    } catch (err) {
-        console.error('❌ Erreur duplication catégorie:', err);
-        res.status(500).json({ error: "Erreur serveur" });
-    }
-});
-
-// ===================================
-// EXPORT MARKDOWN
-// ===================================
-
-// Exporter une catégorie en Markdown
-app.get("/api/export/category/:slug", async (req, res) => {
-    const { slug } = req.params;
-    
-    try {
-        const category = await db.collection("categories").findOne({ slug: slug });
-        
-        if (!category) {
-            return res.status(404).json({ error: "Catégorie introuvable" });
-        }
-        
-        // Récupérer tous les liens de cette catégorie
-        const links = await db.collection("links")
-            .find({ categoryId: category._id.toString() })
-            .sort({ order: 1 })
-            .toArray();
-        
-        // Générer le Markdown
-        let markdown = `# ${category.emoji} ${category.name}\n\n`;
-        markdown += `> Exporté le ${new Date().toLocaleDateString('fr-FR')} depuis le Wiki SGPI\n\n`;
-        markdown += `---\n\n`;
-        
-        const sections = category.sections || [];
-        
-        for (const section of sections) {
-            const sectionLinks = links.filter(l => l.sectionId === section.id);
-            
-            if (sectionLinks.length === 0) continue;
-            
-            markdown += `## ${section.name}\n\n`;
-            
-            for (const link of sectionLinks) {
-                markdown += `- **[${link.name}](${link.url})**`;
-                
-                if (link.badge) {
-                    markdown += ` \`${link.badge}\``;
-                }
-                
-                if (link.description) {
-                    markdown += `  \n  ${link.description}`;
-                }
-                
-                markdown += `\n`;
-            }
-            
-            markdown += `\n`;
-        }
-        
-        markdown += `---\n\n`;
-        markdown += `*Ce document a été généré automatiquement depuis le Wiki SGPI*\n`;
-        
-        // Envoyer le fichier
-        res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
-        res.setHeader('Content-Disposition', `attachment; filename="${slug}.md"`);
-        res.send(markdown);
-        
-        console.log(`📄 Export Markdown : ${category.name}`);
-        
-    } catch (err) {
-        console.error('❌ Erreur export Markdown:', err);
         res.status(500).json({ error: "Erreur serveur" });
     }
 });
