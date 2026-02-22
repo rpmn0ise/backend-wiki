@@ -1974,6 +1974,368 @@ app.use((req, res) => {
     });
 });
 
+
+// ===================================
+// ROUTES ADDITIONNELLES PANEL ADMIN UNIFIÉ
+// À ajouter dans server.js AVANT app.listen() (ligne 1981)
+// ===================================
+
+// ===================================
+// QUICK-ADD (Ajout rapide de liens)
+// ===================================
+
+app.post("/api/admin/quick-add", requireAdmin, async (req, res) => {
+    const { categoryId, sectionId, links } = req.body;
+    
+    if (!categoryId || !sectionId || !Array.isArray(links) || links.length === 0) {
+        return res.status(400).json({ error: "Données invalides" });
+    }
+    
+    try {
+        // Trouver l'ordre max actuel
+        const maxLink = await db.collection("links")
+            .find({ categoryId, sectionId })
+            .sort({ order: -1 })
+            .limit(1)
+            .toArray();
+        
+        let currentOrder = maxLink.length > 0 ? maxLink[0].order + 1 : 0;
+        
+        // Insérer tous les liens
+        const linksToInsert = links.map(link => ({
+            categoryId,
+            sectionId,
+            name: link.name,
+            url: link.url,
+            description: link.description || "",
+            badge: link.badge || "",
+            order: currentOrder++,
+            createdAt: new Date()
+        }));
+        
+        await db.collection("links").insertMany(linksToInsert);
+        
+        // Log
+        await db.collection("admin_logs").insertOne({
+            action: "quick_add",
+            target: `${links.length} liens`,
+            targetId: categoryId,
+            timestamp: new Date()
+        });
+        
+        console.log(`✅ ${links.length} liens ajoutés via quick-add`);
+        
+        res.json({
+            success: true,
+            message: `${links.length} lien${links.length > 1 ? 's' : ''} ajouté${links.length > 1 ? 's' : ''}`
+        });
+        
+    } catch (err) {
+        console.error('❌ Erreur quick-add:', err);
+        res.status(500).json({ error: "Erreur serveur" });
+    }
+});
+
+// ===================================
+// STATISTIQUES DASHBOARD
+// ===================================
+
+app.get("/api/admin/stats/dashboard", async (req, res) => {
+    // Vérifier la clé admin (temporaire)
+    const adminKey = req.headers['x-admin-key'] || req.query.admin_key;
+    
+    if (adminKey !== process.env.ADMIN_KEY) {
+        return res.status(403).json({ error: "Accès refusé" });
+    }
+    
+    try {
+        const stats = {
+            categories: await db.collection("categories").countDocuments(),
+            sections: 0,
+            links: await db.collection("links").countDocuments(),
+            users: await db.collection("users").countDocuments()
+        };
+        
+        // Compter les sections
+        const categories = await db.collection("categories").find({}).toArray();
+        stats.sections = categories.reduce((sum, cat) => sum + (cat.sections?.length || 0), 0);
+        
+        // Activité récente
+        const recentActivity = await db.collection("admin_logs")
+            .find({})
+            .sort({ timestamp: -1 })
+            .limit(10)
+            .toArray();
+        
+        // Top catégories
+        const allCategories = await db.collection("categories")
+            .find({})
+            .sort({ order: 1 })
+            .toArray();
+        
+        for (let cat of allCategories) {
+            cat.linksCount = await db.collection("links").countDocuments({ 
+                categoryId: cat._id.toString() 
+            });
+            cat.sectionsCount = cat.sections?.length || 0;
+        }
+        
+        const topCategories = allCategories
+            .sort((a, b) => b.linksCount - a.linksCount)
+            .slice(0, 5);
+        
+        res.json({
+            success: true,
+            stats,
+            recentActivity,
+            topCategories
+        });
+        
+    } catch (err) {
+        console.error('❌ Erreur stats:', err);
+        res.status(500).json({ error: "Erreur serveur" });
+    }
+});
+
+// ===================================
+// RECHERCHE GLOBALE
+// ===================================
+
+app.get("/api/admin/search", async (req, res) => {
+    // Vérifier la clé admin (temporaire)
+    const adminKey = req.headers['x-admin-key'] || req.query.admin_key;
+    
+    if (adminKey !== process.env.ADMIN_KEY) {
+        return res.status(403).json({ error: "Accès refusé" });
+    }
+    
+    const { q } = req.query;
+    
+    if (!q || q.length < 2) {
+        return res.json({
+            success: true,
+            results: { categories: [], sections: [], links: [] }
+        });
+    }
+    
+    try {
+        const searchRegex = new RegExp(q, 'i');
+        
+        // Rechercher dans les catégories
+        const categories = await db.collection("categories")
+            .find({ $or: [
+                { name: searchRegex },
+                { slug: searchRegex }
+            ]})
+            .limit(10)
+            .toArray();
+        
+        for (let cat of categories) {
+            cat.linksCount = await db.collection("links").countDocuments({ 
+                categoryId: cat._id.toString() 
+            });
+            cat.sectionsCount = cat.sections?.length || 0;
+        }
+        
+        // Rechercher dans les liens
+        const links = await db.collection("links")
+            .find({ $or: [
+                { name: searchRegex },
+                { url: searchRegex },
+                { description: searchRegex }
+            ]})
+            .limit(20)
+            .toArray();
+        
+        res.json({
+            success: true,
+            results: {
+                categories,
+                sections: [],
+                links
+            }
+        });
+        
+    } catch (err) {
+        console.error('❌ Erreur recherche:', err);
+        res.status(500).json({ error: "Erreur serveur" });
+    }
+});
+
+// ===================================
+// VALIDATION DES LIENS
+// ===================================
+
+app.post("/api/admin/validate-links", async (req, res) => {
+    // Vérifier la clé admin (temporaire)
+    const adminKey = req.headers['x-admin-key'] || req.query.admin_key;
+    
+    if (adminKey !== process.env.ADMIN_KEY) {
+        return res.status(403).json({ error: "Accès refusé" });
+    }
+    
+    try {
+        const links = await db.collection("links").find({}).toArray();
+        const results = [];
+        
+        // Limiter à 100 liens pour éviter timeout
+        const linksToCheck = links.slice(0, 100);
+        
+        for (const link of linksToCheck) {
+            // Validation basique (sans fetch pour éviter problèmes de dépendances)
+            try {
+                // Vérifier que l'URL est valide
+                new URL(link.url);
+                
+                results.push({
+                    id: link._id,
+                    name: link.name,
+                    url: link.url,
+                    status: 'ok',
+                    message: 'URL valide'
+                });
+            } catch (err) {
+                results.push({
+                    id: link._id,
+                    name: link.name,
+                    url: link.url,
+                    status: 'error',
+                    error: 'URL invalide'
+                });
+            }
+        }
+        
+        res.json({
+            success: true,
+            results,
+            totalChecked: results.length,
+            totalLinks: links.length,
+            message: 'Validation basique effectuée (vérification HTTP désactivée)'
+        });
+        
+    } catch (err) {
+        console.error('❌ Erreur validation:', err);
+        res.status(500).json({ error: "Erreur serveur" });
+    }
+});
+
+// ===================================
+// EXPORT COMPLET
+// ===================================
+
+app.get("/api/admin/export/full", async (req, res) => {
+    // Vérifier la clé admin (temporaire)
+    const adminKey = req.headers['x-admin-key'] || req.query.admin_key;
+    
+    if (adminKey !== process.env.ADMIN_KEY) {
+        return res.status(403).json({ error: "Accès refusé" });
+    }
+    
+    try {
+        const categories = await db.collection("categories").find({}).toArray();
+        const links = await db.collection("links").find({}).toArray();
+        const users = await db.collection("users").countDocuments();
+        
+        const backup = {
+            exportDate: new Date().toISOString(),
+            version: "2.0",
+            stats: {
+                totalCategories: categories.length,
+                totalLinks: links.length,
+                totalUsers: users
+            },
+            categories,
+            links
+        };
+        
+        res.json({
+            success: true,
+            backup
+        });
+        
+    } catch (err) {
+        console.error('❌ Erreur export:', err);
+        res.status(500).json({ error: "Erreur serveur" });
+    }
+});
+
+// ===================================
+// SYSTÈME DE COMPTES ADMIN (routes temporaires)
+// ===================================
+
+app.post("/api/admin-auth/login", async (req, res) => {
+    const { username, password } = req.body;
+    
+    // Temporaire : accepter si password = adminsgpi
+    if (password === 'adminsgpi') {
+        const fakeToken = crypto.randomBytes(32).toString('hex');
+        
+        res.json({
+            success: true,
+            token: fakeToken,
+            admin: {
+                id: 'temp-admin-id',
+                username: username,
+                email: 'admin@sgpi.local',
+                role: 'super_admin',
+                permissions: {
+                    manageCategories: true,
+                    manageLinks: true,
+                    manageUsers: true,
+                    manageAdmins: true,
+                    viewLogs: true,
+                    exportData: true
+                }
+            }
+        });
+    } else {
+        res.status(401).json({ error: "Identifiants incorrects" });
+    }
+});
+
+app.get("/api/admin-auth/verify", async (req, res) => {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    
+    if (!token) {
+        return res.status(401).json({ error: "Token manquant" });
+    }
+    
+    // Temporaire : accepter n'importe quel token
+    res.json({
+        valid: true,
+        admin: {
+            id: 'temp-admin-id',
+            username: 'admin',
+            email: 'admin@sgpi.local',
+            role: 'super_admin',
+            permissions: {
+                manageCategories: true,
+                manageLinks: true,
+                manageUsers: true,
+                manageAdmins: true,
+                viewLogs: true,
+                exportData: true
+            }
+        }
+    });
+});
+
+app.get("/api/admin-auth/list", async (req, res) => {
+    // Temporaire : retourner une liste vide
+    res.json({
+        success: true,
+        admins: []
+    });
+});
+
+console.log("✅ Routes Panel Admin Unifié chargées");
+
+// ===================================
+// FIN DES ROUTES ADDITIONNELLES
+// Placer AVANT app.listen()
+// ===================================
+
+
 // ===================================
 // START SERVER
 // ===================================
