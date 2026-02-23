@@ -2064,26 +2064,37 @@ console.log("✅ Routes Panel Admin Unifié chargées");
 // ===================================
 
 app.post("/api/admin/quick-add", requireAdmin, async (req, res) => {
-    const { categoryId, sectionId, links } = req.body;
-    
-    if (!categoryId || !sectionId || !Array.isArray(links) || links.length === 0) {
-        return res.status(400).json({ error: "Données invalides" });
+    const { categoryId, subCategoryId, subSubCategoryId, links } = req.body;
+
+    // Validation
+    if (
+        !categoryId
+        || !subCategoryId
+        || !subSubCategoryId
+        || !Array.isArray(links)
+        || links.length === 0
+    ) {
+        return res.status(400).json({ error: "Données invalides ou incomplètes" });
     }
-    
+
     try {
-        // Trouver l'ordre max actuel
+        // On va insérer les liens en utilisant subSubCategoryId comme sectionId
+        const sectionId = subSubCategoryId; 
+
+        // Trouver l'ordre max actuel dans cette sous-sous-catégorie
         const maxLink = await db.collection("links")
             .find({ categoryId, sectionId })
             .sort({ order: -1 })
             .limit(1)
             .toArray();
-        
+
         let currentOrder = maxLink.length > 0 ? maxLink[0].order + 1 : 0;
-        
-        // Insérer tous les liens
+
+        // Construire les documents à insérer
         const linksToInsert = links.map(link => ({
             categoryId,
-            sectionId,
+            sectionId,              // Utilisation du sous-sous-catégorie
+            subCategoryId,          // Stockage (facultatif) pour savoir le niveau
             name: link.name,
             url: link.url,
             description: link.description || "",
@@ -2091,26 +2102,27 @@ app.post("/api/admin/quick-add", requireAdmin, async (req, res) => {
             order: currentOrder++,
             createdAt: new Date()
         }));
-        
+
+        // Insertion
         await db.collection("links").insertMany(linksToInsert);
-        
-        // Log
+
+        // Log Admin
         await db.collection("admin_logs").insertOne({
             action: "quick_add",
             target: `${links.length} liens`,
             targetId: categoryId,
             timestamp: new Date()
         });
-        
-        console.log(`✅ ${links.length} liens ajoutés via quick-add`);
-        
+
+        console.log(`✅ ${links.length} liens ajoutés (quick-add, 3 niveaux)`);
+
         res.json({
             success: true,
-            message: `${links.length} lien${links.length > 1 ? 's' : ''} ajouté${links.length > 1 ? 's' : ''}`
+            message: `${links.length} lien${links.length > 1 ? "s" : ""} ajouté${links.length > 1 ? "s" : ""}`
         });
-        
+
     } catch (err) {
-        console.error('❌ Erreur quick-add:', err);
+        console.error("❌ Erreur quick-add 3 niveaux:", err);
         res.status(500).json({ error: "Erreur serveur" });
     }
 });
