@@ -1375,13 +1375,25 @@ app.get("/api/categories", async (req, res) => {
             .sort({ order: 1 })
             .toArray();
         
-        // Ajouter le nombre de sections et liens pour chaque catégorie
+        // Ajouter le nombre de sous-catégories, sous-sous-catégories et liens
         for (let cat of categories) {
             const linksCount = await db.collection("links").countDocuments({ 
                 categoryId: cat._id.toString() 
             });
             cat.linksCount = linksCount;
-            cat.sectionsCount = cat.sections ? cat.sections.length : 0;
+            
+            // Support structure 3 niveaux
+            const subCategories = cat.subCategories || cat.sections || [];
+            cat.sectionsCount = subCategories.length; // Rétrocompatibilité
+            cat.subCategoriesCount = subCategories.length;
+            
+            // Compter les sous-sous-catégories
+            let subSubCount = 0;
+            subCategories.forEach(subCat => {
+                const subSubCategories = subCat.subSubCategories || [];
+                subSubCount += subSubCategories.length;
+            });
+            cat.subSubCategoriesCount = subSubCount;
         }
         
         res.json({ success: true, categories });
