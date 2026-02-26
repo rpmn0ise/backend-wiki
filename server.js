@@ -2191,11 +2191,10 @@ console.log("✅ Routes Panel Admin Unifié chargées");
 app.post("/api/admin/quick-add", requireAdmin, async (req, res) => {
     const { categoryId, subCategoryId, subSubCategoryId, links } = req.body;
 
-    // Validation
+    // Validation - subSubCategoryId est maintenant OPTIONNEL
     if (
         !categoryId
         || !subCategoryId
-        || !subSubCategoryId
         || !Array.isArray(links)
         || links.length === 0
     ) {
@@ -2203,32 +2202,50 @@ app.post("/api/admin/quick-add", requireAdmin, async (req, res) => {
     }
 
     try {
-        // Trouver l'ordre max actuel dans cette sous-sous-catégorie
+        // Construire le filtre pour trouver l'ordre max
+        const filter = {
+            categoryId,
+            subCategoryId
+        };
+        
+        // Ajouter subSubCategoryId au filtre seulement s'il existe
+        if (subSubCategoryId) {
+            filter.subSubCategoryId = subSubCategoryId;
+        }
+        
+        // Trouver l'ordre max actuel
         const maxLink = await db.collection("links")
-            .find({ 
-                categoryId, 
-                subCategoryId, 
-                subSubCategoryId 
-            })
+            .find(filter)
             .sort({ order: -1 })
             .limit(1)
             .toArray();
 
         let currentOrder = maxLink.length > 0 ? maxLink[0].order + 1 : 0;
 
-        // Construire les documents à insérer avec les 3 niveaux d'IDs
-        const linksToInsert = links.map(link => ({
-            categoryId,
-            subCategoryId,          // Niveau 2
-            subSubCategoryId,       // Niveau 3
-            sectionId: subSubCategoryId, // Rétrocompatibilité (pour ancienne structure)
-            name: link.name,
-            url: link.url,
-            description: link.description || "",
-            badge: link.badge || "",
-            order: currentOrder++,
-            createdAt: new Date()
-        }));
+        // Construire les documents à insérer
+        const linksToInsert = links.map(link => {
+            const linkDoc = {
+                categoryId,
+                subCategoryId,          // Niveau 2 (toujours présent)
+                name: link.name,
+                url: link.url,
+                description: link.description || "",
+                badge: link.badge || "",
+                order: currentOrder++,
+                createdAt: new Date()
+            };
+            
+            // Ajouter subSubCategoryId seulement s'il existe (liens spécifiques)
+            if (subSubCategoryId) {
+                linkDoc.subSubCategoryId = subSubCategoryId;
+                linkDoc.sectionId = subSubCategoryId; // Rétrocompatibilité
+            } else {
+                // Liens généraux dans la sous-catégorie
+                linkDoc.sectionId = subCategoryId; // Rétrocompatibilité
+            }
+            
+            return linkDoc;
+        });
 
         // Insertion
         await db.collection("links").insertMany(linksToInsert);
@@ -2241,11 +2258,12 @@ app.post("/api/admin/quick-add", requireAdmin, async (req, res) => {
             timestamp: new Date()
         });
 
-        console.log(`✅ ${links.length} liens ajoutés (quick-add, 3 niveaux)`);
+        const level = subSubCategoryId ? "sous-sous-catégorie" : "sous-catégorie";
+        console.log(`✅ ${links.length} liens ajoutés dans ${level}`);
 
         res.json({
             success: true,
-            message: `${links.length} lien${links.length > 1 ? "s" : ""} ajouté${links.length > 1 ? "s" : ""}`
+            message: `${links.length} lien${links.length > 1 ? "s" : ""} ajouté${links.length > 1 ? "s" : ""} ${subSubCategoryId ? 'dans la sous-sous-catégorie' : 'dans la sous-catégorie'}`
         });
 
     } catch (err) {
